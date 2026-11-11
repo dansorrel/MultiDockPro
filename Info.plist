@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>pt-BR</string>
+    <key>CFBundleExecutable</key>
+    <string>MultiDockPro</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.dansorrel.MultiDockPro</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>MultiDock Pro</string>
+    <key>CFBundleDisplayName</key>
+    <string>MultiDock Pro</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>2</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>O MultiDock Pro usa AppleEvents para alternar a ocultação automática do Dock nativo do macOS caso você solicite.</string>
+</dict>
+</plist>
