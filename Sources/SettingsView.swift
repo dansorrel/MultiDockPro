@@ -4,12 +4,12 @@ import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject var store = DockStore.shared
+    @ObservedObject var windowManager = DockWindowManager.shared
     @State private var selectedFolderID: UUID?
     @State private var showingNewFolderSheet = false
     @State private var newFolderName = ""
     @State private var newFolderSymbol = "folder.fill"
     @State private var newFolderColor = "#007AFF"
-    @State private var axPermissionGranted = DockWindowManager.shared.isAccessibilityGranted
     @State private var launchAtLogin = LaunchAtLoginManager.shared.isEnabled
     
     private let presetSymbols = [
@@ -94,9 +94,6 @@ struct SettingsView: View {
             }
         }
         .frame(minWidth: 880, minHeight: 610)
-        .onAppear {
-            axPermissionGranted = DockWindowManager.shared.isAccessibilityGranted
-        }
     }
     
     // MARK: - Detail Editor for Selected Dock
@@ -179,16 +176,18 @@ struct SettingsView: View {
                             Spacer()
                             
                             if dock.wrappedValue.reserveScreenSpace {
-                                if axPermissionGranted {
-                                    Label("Proteção Ativa", systemImage: "checkmark.shield.fill")
+                                if windowManager.axAuthorized {
+                                    Label("Proteção Ativa (Janelas Bloqueadas na Área do Dock)", systemImage: "checkmark.shield.fill")
                                         .font(.caption.bold())
                                         .foregroundColor(.green)
                                 } else {
                                     Button {
-                                        let granted = DockWindowManager.shared.requestAccessibilityPermissionForProtectionZone()
-                                        axPermissionGranted = granted
+                                        _ = DockWindowManager.shared.requestAccessibilityPermissionForProtectionZone()
+                                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                                            NSWorkspace.shared.open(url)
+                                        }
                                     } label: {
-                                        Label("Autorizar Permissão de Janelas (Acessibilidade)", systemImage: "lock.shield")
+                                        Label("Ativar Permissão em Ajustes > Acessibilidade", systemImage: "lock.shield")
                                             .font(.caption)
                                     }
                                     .buttonStyle(.borderedProminent)

@@ -20,7 +20,7 @@ final class FloatingDockPanel: NSPanel {
         )
         
         self.isFloatingPanel = true
-        // Use screenSaver / statusBar + 1 level so it stays visible even above full-screen or maximized spaces
+        // Use statusWindow + 1 level so it stays visible even above maximized windows
         self.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         self.backgroundColor = .clear
@@ -39,10 +39,13 @@ final class FloatingDockPanel: NSPanel {
 final class DockWindowManager: ObservableObject {
     static let shared = DockWindowManager()
     
+    @Published var axAuthorized: Bool = AXIsProcessTrusted()
+    
     private var panels: [String: FloatingDockPanel] = [:] // key: "\(dockID)_\(screenName)"
     private var dragStartFrames: [String: NSRect] = [:]
     private var cancellables = Set<AnyCancellable>()
     private var windowProtectionTimer: Timer?
+    private var axObservers: [pid_t: AXObserver] = [:]
     var onOpenSettingsRequested: ((UUID?) -> Void)?
     
     private let edgeSnapThreshold: CGFloat = 46.0
@@ -54,6 +57,7 @@ final class DockWindowManager: ObservableObject {
             .debounce(for: .milliseconds(25), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 self?.syncAllPanels()
+                self?.enforceScreenProtectionZone()
             }
             .store(in: &cancellables)
         
@@ -69,6 +73,7 @@ final class DockWindowManager: ObservableObject {
     
     @objc private func screensDidChange() {
         syncAllPanels()
+        enforceScreenProtectionZone()
     }
     
     func syncAllPanels() {
@@ -110,7 +115,6 @@ final class DockWindowManager: ObservableObject {
             panels.removeValue(forKey: key)
         }
         
-        // After laying out all panels, resolve any overlaps between snapped side-by-side docks
         resolveSnappedOverlaps()
     }
     
@@ -230,18 +234,14 @@ final class DockWindowManager: ObservableObject {
         for other in otherPanels {
             let of = other.frame
             
-            // Check horizontal adjacency (side-by-side)
             let verticalOverlap = min(result.maxY, of.maxY) - max(result.minY, of.minY)
             if verticalOverlap > -24 {
-                // Snap left edge of moving dock to right edge of other dock
                 if abs(result.minX - of.maxX) < dockToDockSnapThreshold {
                     result.origin.x = of.maxX + dockSpacingGap
                     if abs(result.midY - of.midY) < dockToDockSnapThreshold {
                         result.origin.y = of.midY - result.height / 2
                     }
-                }
-                // Snap right edge of moving dock to left edge of other dock
-                else if abs(result.maxX - of.minX) < dockToDockSnapThreshold {
+                } else if abs(result.maxX - of.minX) < dockToDockSnapThreshold {
                     result.origin.x = of.minX - result.width - dockSpacingGap
                     if abs(result.midY - of.midY) < dockToDockSnapThreshold {
                         result.origin.y = of.midY - result.height / 2
@@ -249,18 +249,14 @@ final class DockWindowManager: ObservableObject {
                 }
             }
             
-            // Check vertical adjacency (stacked)
             let horizontalOverlap = min(result.maxX, of.maxX) - max(result.minX, of.minX)
             if horizontalOverlap > -24 {
-                // Snap bottom edge of moving dock to top edge of other dock
                 if abs(result.minY - of.maxY) < dockToDockSnapThreshold {
                     result.origin.y = of.maxY + dockSpacingGap
                     if abs(result.midX - of.midX) < dockToDockSnapThreshold {
                         result.origin.x = of.midX - result.width / 2
                     }
-                }
-                // Snap top edge of moving dock to bottom edge of other dock
-                else if abs(result.maxY - of.minY) < dockToDockSnapThreshold {
+                } else if abs(result.maxY - of.minY) < dockToDockSnapThreshold {
                     result.origin.y = of.minY - result.height - dockSpacingGap
                     if abs(result.midX - of.midX) < dockToDockSnapThreshold {
                         result.origin.x = of.midX - result.width / 2
@@ -268,7 +264,6 @@ final class DockWindowManager: ObservableObject {
                 }
             }
             
-            // Prevent direct collision if overlapping another dock
             if result.intersects(of) {
                 let pushRight = of.maxX + dockSpacingGap
                 let pushLeft = of.minX - result.width - dockSpacingGap
@@ -321,7 +316,6 @@ final class DockWindowManager: ObservableObject {
             dock.targetScreenName = currentScreen.localizedName
         }
         
-        // Apply magnetic snap to sibling docks first
         let snappedFrame = applyMagneticDockSnap(
             proposedFrame: panel.frame,
             movingPanel: panel,
@@ -362,70 +356,112 @@ final class DockWindowManager: ObservableObject {
         enforceScreenProtectionZone()
     }
     
-    // MARK: - Dock Protection Zone (Prevents Maximized / Active App Windows from Covering Dock)
+    // MARK: - Real-Time Dock Protection Zone (Like macOS Native Dock!)
+    // Prevents any window on any screen from entering the area occupied by our snapped Docks.
     
     private func setupScreenProtectionObserver() {
-        NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.enforceScreenProtectionZone()
+        // Check and prompt for Accessibility permission on launch if any dock has protection enabled
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self = self else { return }
+            self.axAuthorized = AXIsProcessTrusted()
+            let needsProtection = DockStore.shared.docks.contains { $0.isEnabled && $0.reserveScreenSpace }
+            if needsProtection && !self.axAuthorized {
+                _ = self.requestAccessibilityPermissionForProtectionZone()
+            }
+            self.registerAXObserversForAllRunningApps()
+            self.enforceScreenProtectionZone()
         }
         
-        windowProtectionTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        let wsnc = NSWorkspace.shared.notificationCenter
+        wsnc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                self?.registerAXObserver(for: app.processIdentifier)
+            }
             self?.enforceScreenProtectionZone()
+        }
+        wsnc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                self?.registerAXObserver(for: app.processIdentifier)
+            }
+            self?.enforceScreenProtectionZone()
+        }
+        wsnc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                self?.removeAXObserver(for: app.processIdentifier)
+            }
+        }
+        
+        // Fast 0.35s heartbeat ensures continuous protection and updates AX status immediately after user grants permission
+        windowProtectionTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let trusted = AXIsProcessTrusted()
+            if trusted != self.axAuthorized {
+                self.axAuthorized = trusted
+                if trusted {
+                    self.registerAXObserversForAllRunningApps()
+                }
+            }
+            if trusted {
+                self.enforceScreenProtectionZone()
+            }
         }
     }
     
     func requestAccessibilityPermissionForProtectionZone() -> Bool {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        return AXIsProcessTrustedWithOptions(options)
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        self.axAuthorized = trusted
+        return trusted
     }
     
     var isAccessibilityGranted: Bool {
         AXIsProcessTrusted()
     }
     
-    func enforceScreenProtectionZone() {
-        let protectedDocks = DockStore.shared.docks.filter { $0.isEnabled && $0.reserveScreenSpace && !$0.autoHide && $0.snapEdge != .free }
-        guard !protectedDocks.isEmpty, AXIsProcessTrusted() else { return }
+    private func registerAXObserversForAllRunningApps() {
+        guard AXIsProcessTrusted() else { return }
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            registerAXObserver(for: app.processIdentifier)
+        }
+    }
+    
+    private func registerAXObserver(for pid: pid_t) {
+        guard AXIsProcessTrusted(),
+              pid != ProcessInfo.processInfo.processIdentifier,
+              axObservers[pid] == nil else { return }
         
-        guard let frontApp = NSWorkspace.shared.frontmostApplication,
-              frontApp.bundleIdentifier != Bundle.main.bundleIdentifier,
-              frontApp.bundleIdentifier != "com.apple.finder" else { return }
+        var observer: AXObserver?
+        let callback: AXObserverCallback = { _, _, _, _ in
+            DispatchQueue.main.async {
+                DockWindowManager.shared.enforceScreenProtectionZone()
+            }
+        }
         
-        let appRef = AXUIElementCreateApplication(frontApp.processIdentifier)
-        var focusedWindowObj: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedWindowObj) == .success,
-              let windowRef = focusedWindowObj else { return }
-        let axWindow = windowRef as! AXUIElement
+        guard AXObserverCreate(pid, callback, &observer) == .success,
+              let axObs = observer else { return }
         
-        // Read window position and size (AX uses top-left global screen coordinates)
-        var posObj: CFTypeRef?
-        var sizeObj: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &posObj) == .success,
-              AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeObj) == .success else { return }
+        let appElem = AXUIElementCreateApplication(pid)
+        AXObserverAddNotification(axObs, appElem, kAXWindowMovedNotification as CFString, nil)
+        AXObserverAddNotification(axObs, appElem, kAXWindowResizedNotification as CFString, nil)
+        AXObserverAddNotification(axObs, appElem, kAXFocusedWindowChangedNotification as CFString, nil)
+        AXObserverAddNotification(axObs, appElem, kAXWindowCreatedNotification as CFString, nil)
         
-        var winPos = CGPoint.zero
-        var winSize = CGSize.zero
-        AXValueGetValue(posObj as! AXValue, .cgPoint, &winPos)
-        AXValueGetValue(sizeObj as! AXValue, .cgSize, &winSize)
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObs), .defaultMode)
+        axObservers[pid] = axObs
+    }
+    
+    private func removeAXObserver(for pid: pid_t) {
+        if let obs = axObservers.removeValue(forKey: pid) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .defaultMode)
+        }
+    }
+    
+    /// Computes the protected safe area for a given screen by subtracting all snapped docks on that screen
+    private func computeSafeRect(for screen: NSScreen, protectedDocks: [DockInstance]) -> NSRect {
+        var safeRect = screen.visibleFrame
+        let screenPanels = panels.values.filter { $0.assignedScreen.localizedName == screen.localizedName }
         
-        guard let primaryScreen = NSScreen.screens.first else { return }
-        let primaryHeight = primaryScreen.frame.height
-        
-        // Convert AX top-left coordinates to AppKit bottom-left coordinates
-        let appKitWinY = primaryHeight - (winPos.y + winSize.height)
-        var appKitWinRect = NSRect(x: winPos.x, y: appKitWinY, width: winSize.width, height: winSize.height)
-        
-        // Find which screen this window is primarily on
-        guard let winScreen = NSScreen.screens.first(where: { $0.frame.intersects(appKitWinRect) }) else { return }
-        let vf = winScreen.visibleFrame
-        
-        // Compute safe area inset for all snapped protected docks on this screen
-        var safeRect = vf
-        for panel in panels.values where panel.assignedScreen.localizedName == winScreen.localizedName {
+        for panel in screenPanels {
             guard let dock = protectedDocks.first(where: { $0.id == panel.dockID }) else { continue }
             let pf = panel.frame
             
@@ -460,40 +496,159 @@ final class DockWindowManager: ObservableObject {
                 break
             }
         }
+        return safeRect
+    }
+    
+    func enforceScreenProtectionZone() {
+        let protectedDocks = DockStore.shared.docks.filter { $0.isEnabled && $0.reserveScreenSpace && !$0.autoHide && $0.snapEdge != .free }
+        guard !protectedDocks.isEmpty, AXIsProcessTrusted() else { return }
+        guard let primaryScreen = NSScreen.screens.first else { return }
+        let primaryHeight = primaryScreen.frame.height
         
-        // Only adjust if the window is intruding into our Dock's protected margin
+        // Check all visible regular applications (frontmost first so active app reacts immediately)
+        let runningApps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular &&
+            !$0.isHidden &&
+            $0.bundleIdentifier != Bundle.main.bundleIdentifier &&
+            $0.bundleIdentifier != "com.apple.finder"
+        }
+        
+        for app in runningApps {
+            let appRef = AXUIElementCreateApplication(app.processIdentifier)
+            
+            var windowsObj: CFTypeRef?
+            var axWindows: [AXUIElement] = []
+            if AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsObj) == .success,
+               let list = windowsObj as? [AXUIElement] {
+                axWindows = list
+            } else {
+                var focusedObj: CFTypeRef?
+                if AXUIElementCopyAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, &focusedObj) == .success,
+                   let w = focusedObj {
+                    axWindows = [w as! AXUIElement]
+                }
+            }
+            
+            for axWindow in axWindows {
+                constrainWindowIfNeeded(axWindow, primaryHeight: primaryHeight, protectedDocks: protectedDocks)
+            }
+        }
+    }
+    
+    private func constrainWindowIfNeeded(_ axWindow: AXUIElement, primaryHeight: CGFloat, protectedDocks: [DockInstance]) {
+        // Skip minimized or native full-screen space windows
+        var minObj: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axWindow, kAXMinimizedAttribute as CFString, &minObj) == .success,
+           let isMin = minObj as? Bool, isMin {
+            return
+        }
+        var fsObj: CFTypeRef?
+        if AXUIElementCopyAttributeValue(axWindow, "AXFullScreen" as CFString, &fsObj) == .success,
+           let isFS = fsObj as? Bool, isFS {
+            return
+        }
+        
+        var posObj: CFTypeRef?
+        var sizeObj: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &posObj) == .success,
+              AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sizeObj) == .success else { return }
+        
+        var winPos = CGPoint.zero
+        var winSize = CGSize.zero
+        AXValueGetValue(posObj as! AXValue, .cgPoint, &winPos)
+        AXValueGetValue(sizeObj as! AXValue, .cgSize, &winSize)
+        
+        // Ignore tiny utility popovers/tooltips
+        guard winSize.width > 180, winSize.height > 140 else { return }
+        
+        // Convert Quartz/AX top-left origin to AppKit bottom-left origin
+        let appKitWinY = primaryHeight - (winPos.y + winSize.height)
+        var rect = NSRect(x: winPos.x, y: appKitWinY, width: winSize.width, height: winSize.height)
+        
+        // Find the screen with the largest intersection area with this window
+        guard let winScreen = NSScreen.screens.max(by: { a, b in
+            let ia = a.frame.intersection(rect)
+            let ib = b.frame.intersection(rect)
+            let areaA = ia.isNull ? 0 : ia.width * ia.height
+            let areaB = ib.isNull ? 0 : ib.width * ib.height
+            return areaA < areaB
+        }) else { return }
+        
+        let intersection = winScreen.frame.intersection(rect)
+        guard !intersection.isNull, intersection.width * intersection.height > 0 else { return }
+        
+        let safeRect = computeSafeRect(for: winScreen, protectedDocks: protectedDocks)
+        guard safeRect != winScreen.visibleFrame else { return }
+        
         var modified = false
-        if appKitWinRect.minY < safeRect.minY && abs(appKitWinRect.minY - vf.minY) < 120 {
-            let overlap = safeRect.minY - appKitWinRect.minY
-            appKitWinRect.origin.y = safeRect.minY
-            appKitWinRect.size.height = max(200, appKitWinRect.size.height - overlap)
+        let tolerance: CGFloat = 1.5
+        
+        // 1. Protect BOTTOM Dock zone: no window's bottom edge (minY) may go below safeRect.minY
+        if rect.minY < safeRect.minY - tolerance {
+            let maxAllowedHeight = safeRect.maxY - safeRect.minY
+            if rect.height > maxAllowedHeight {
+                // Window is taller than the safe area (e.g. maximized) -> shrink height so it fits above the dock
+                rect.origin.y = safeRect.minY
+                rect.size.height = maxAllowedHeight
+            } else {
+                // Window fits in safe area -> push it up above the dock, clamping top to safeRect.maxY
+                rect.origin.y = safeRect.minY
+                if rect.maxY > safeRect.maxY {
+                    rect.size.height = max(140, safeRect.maxY - safeRect.minY)
+                }
+            }
             modified = true
         }
-        if appKitWinRect.maxY > safeRect.maxY && abs(appKitWinRect.maxY - vf.maxY) < 120 {
-            let overlap = appKitWinRect.maxY - safeRect.maxY
-            appKitWinRect.size.height = max(200, appKitWinRect.size.height - overlap)
+        
+        // 2. Protect TOP Dock zone: no window's top edge (maxY) may go above safeRect.maxY
+        if rect.maxY > safeRect.maxY + tolerance {
+            let overlap = rect.maxY - safeRect.maxY
+            if rect.minY - overlap >= safeRect.minY {
+                rect.origin.y -= overlap
+            } else {
+                rect.origin.y = safeRect.minY
+                rect.size.height = max(140, safeRect.maxY - safeRect.minY)
+            }
             modified = true
         }
-        if appKitWinRect.minX < safeRect.minX && abs(appKitWinRect.minX - vf.minX) < 120 {
-            let overlap = safeRect.minX - appKitWinRect.minX
-            appKitWinRect.origin.x = safeRect.minX
-            appKitWinRect.size.width = max(300, appKitWinRect.size.width - overlap)
+        
+        // 3. Protect LEFT Dock zone: no window's left edge (minX) may go left of safeRect.minX
+        if rect.minX < safeRect.minX - tolerance {
+            let maxAllowedWidth = safeRect.maxX - safeRect.minX
+            if rect.width > maxAllowedWidth {
+                rect.origin.x = safeRect.minX
+                rect.size.width = maxAllowedWidth
+            } else {
+                rect.origin.x = safeRect.minX
+                if rect.maxX > safeRect.maxX {
+                    rect.size.width = max(200, safeRect.maxX - safeRect.minX)
+                }
+            }
             modified = true
         }
-        if appKitWinRect.maxX > safeRect.maxX && abs(appKitWinRect.maxX - vf.maxX) < 120 {
-            let overlap = appKitWinRect.maxX - safeRect.maxX
-            appKitWinRect.size.width = max(300, appKitWinRect.size.width - overlap)
+        
+        // 4. Protect RIGHT Dock zone: no window's right edge (maxX) may go right of safeRect.maxX
+        if rect.maxX > safeRect.maxX + tolerance {
+            let overlap = rect.maxX - safeRect.maxX
+            if rect.minX - overlap >= safeRect.minX {
+                rect.origin.x -= overlap
+            } else {
+                rect.origin.x = safeRect.minX
+                rect.size.width = max(200, safeRect.maxX - safeRect.minX)
+            }
             modified = true
         }
         
         if modified {
             var newAXPos = CGPoint(
-                x: appKitWinRect.origin.x,
-                y: primaryHeight - (appKitWinRect.origin.y + appKitWinRect.size.height)
+                x: rect.origin.x,
+                y: primaryHeight - (rect.origin.y + rect.size.height)
             )
-            var newAXSize = appKitWinRect.size
-            if let posVal = AXValueCreate(.cgPoint, &newAXPos),
-               let sizeVal = AXValueCreate(.cgSize, &newAXSize) {
+            var newAXSize = rect.size
+            if let sizeVal = AXValueCreate(.cgSize, &newAXSize),
+               let posVal = AXValueCreate(.cgPoint, &newAXPos) {
+                // Set size first, then position, then size again (handles apps that clamp position based on current size)
+                AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeVal)
                 AXUIElementSetAttributeValue(axWindow, kAXPositionAttribute as CFString, posVal)
                 AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeVal)
             }
